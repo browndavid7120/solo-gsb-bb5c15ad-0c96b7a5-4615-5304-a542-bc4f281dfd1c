@@ -24,6 +24,8 @@ from .schemas import (
     RequestList,
     ReversalCreate,
     ReversalList,
+    ReversalPlanRequest,
+    ReversalPlanView,
     ReversalView,
     ReservationConfirm,
     ReservationCreate,
@@ -94,7 +96,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -150,7 +152,19 @@ app = FastAPI(
         "(omitted once max_runs is reached), with pure-epsilon items still "
         "composed by exact addition; it creates no requests, does not sweep "
         "reservations and recomputes against the latest ledger on every call.  "
-        "Finally, a "
+        "A read-only reversal-plan trial additionally accepts one pending "
+        "analysis item (epsilon, delta) together with 1-12 distinct granted, "
+        "non-reversed request_ids: taking the other non-reversed granted "
+        "requests plus the currently non-expired reservations as a fixed "
+        "baseline, it enumerates every candidate reversal subset and projects "
+        "the pending item with the same RDP accounting, then suggests a "
+        "feasible subset that keeps the composed epsilon within the cap -- "
+        "fewest reversals first, then the largest post-reversal ledger "
+        "occupancy, then the lexicographically smallest ascending request_id "
+        "list -- returning the suggested ids with the before-reversal, "
+        "after-reversal and with-pending occupancies, or an explicit "
+        "infeasible answer when no subset fits; it reverses nothing, submits "
+        "nothing and never sweeps reservations.  Finally, a "
         "granted analysis request can be reversed with a globally unique "
         "reversal_id and reason: the original verdict and reservation history "
         "stay untouched while an immutable reversal record removes the request "
@@ -448,6 +462,19 @@ async def create_repeat_run_trial(
     dataset_id: DATASET_ID, payload: RepeatRunTrialRequest
 ) -> dict:
     return await ledger.repeat_run_trial(dataset_id, payload)
+
+
+@app.post(
+    "/datasets/{dataset_id}/reversal-plans",
+    response_model=ReversalPlanView,
+    tags=["reversal-plans"],
+    summary="Trial the smallest reversal subset admitting a pending item "
+    "(read-only)",
+)
+async def create_reversal_plan(
+    dataset_id: DATASET_ID, payload: ReversalPlanRequest
+) -> dict:
+    return await ledger.reversal_plan(dataset_id, payload)
 
 
 @app.get(

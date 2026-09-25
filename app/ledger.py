@@ -21,6 +21,7 @@ from .schemas import (
     RepeatRunTrialRequest,
     RepeatRunWorkloadItem,
     ReversalCreate,
+    ReversalPlanRequest,
     ReservationConfirm,
     ReservationCreate,
     ReservationRenewalCreate,
@@ -1882,4 +1883,244 @@ async def repeat_run_trial(
         "next_run_projection": None
         if at_max_runs
         else _view(max_runs_feasible + 1),
+    }
+
+
+# ------------------------------------------------------------ reversal plans --
+
+
+async def reversal_plan(
+    dataset_id: str, payload: ReversalPlanRequest
+) -> dict[str, Any]:
+    """Read-only trial: the smallest reversal subset admitting a pending item.
+
+    The baseline is composed from every *other* granted, non-reversed request
+    plus the granted reservations that have not expired *right now*; the 1-12
+    candidate requests (each granted and non-reversed) are the only requests
+    that may be reversed.  Every reversal subset of the candidates is
+    enumerated and the pending analysis item is projected on top of the
+    baseline plus the candidates that would remain, using the exact same RDP
+    accounting as admission checks.  A subset is feasible when that
+    projection stays within ``epsilon_cap + EPSILON_TOLERANCE``.
+
+    Among the feasible subsets the plan picks, in order:
+
+    1. the fewest reversed requests;
+    2. then the largest post-reversal ledger occupancy (the reversal that
+       frees the least budget);
+    3. then the lexicographically smallest ascending request_id list.
+
+    The empty subset competes too, so a pending item that already fits is
+    answered with zero suggested reversals.  When no subset -- not even
+    reversing every candidate -- fits, the plan is explicitly infeasible.
+
+    Like the release forecast, selection plan, cost attribution and
+    repeat-run trial this path issues pure SELECTs only: it never sweeps
+    reservation expiry, never reverses or submits anything and creates no
+    record of any kind, so every call recomputes against the live ledger.
+    """
+    now = utcnow()
+    now_iso = now.isoformat()
+    selected_ids = payload.request_ids
+
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        # Pure SELECTs only (no lazy expiry UPDATE), so the trial is strictly
+        # read-only; reservations past their TTL simply do not qualify.
+        eligible_rows = await db.list_granted_request_rows(conn, dataset_id)
+        reservation_rows = await db.list_granted_reservation_rows(
+            conn, dataset_id, now_iso=now_iso
+        )
+        # Fetch the live row (granted/rejected, with or without a reversal)
+        # for each candidate id so the validation reports 404/409 precisely.
+        selected_rows = [
+            await db.get_request(conn, dataset_id, request_id)
+            for request_id in selected_ids
+        ]
+        assert not conn.in_transaction
+
+    # Validate the whole candidate set against the live ledger.  A missing id
+    # is 404; a rejected or already-reversed id is 409, reported in request
+    # order.
+    by_id = {row["request_id"]: row for row in eligible_rows}
+    for request_id, row in zip(selected_ids, selected_rows):
+        if row is None:
+            raise db.RequestNotFound(request_id)
+        if row["status"] != "granted":
+            raise db.ReversalStateConflict(
+                "request_not_granted",
+                f"request {request_id!r} is {row['status']} and cannot be "
+                "reversed; only granted requests are reversal candidates",
+            )
+        if request_id not in by_id:
+            # Granted but carrying a reversal row: already reversed.
+            raise db.ReversalStateConflict(
+                "request_already_reversed",
+                f"request {request_id!r} was already reversed and no longer "
+                "occupies any budget",
+            )
+
+    cap = dataset["epsilon_cap"]
+    target_delta = dataset["delta_cap"]
+
+    selected_set = set(selected_ids)
+    baseline_entries = [
+        (row["epsilon"], row["delta"])
+        for row in eligible_rows
+        if row["request_id"] not in selected_set
+    ]
+    baseline_entries.extend(
+        (row["epsilon"], row["delta"]) for row in reservation_rows
+    )
+
+    # Decompose the fixed baseline once so each of the 2**n subset projections
+    # is a cheap per-order sum instead of recomposing the whole ledger.
+    base_pure = sum(eps for eps, d in baseline_entries if d == 0.0)
+    base_approx_curve = rdp.compose_rdp(
+        [
+            rdp.single_rdp_curve(eps, d)
+            for eps, d in baseline_entries
+            if d > 0.0
+        ]
+    )
+    baseline_has_approx = any(d > 0.0 for _, d in baseline_entries)
+    n_orders = len(rdp.RDP_ORDERS)
+
+    selected = [by_id[request_id] for request_id in selected_ids]
+    cand_ids = [row["request_id"] for row in selected]
+    cand_pure = [
+        row["epsilon"] if row["delta"] == 0.0 else 0.0 for row in selected
+    ]
+    cand_curves = [
+        rdp.single_rdp_curve(row["epsilon"], row["delta"])
+        if row["delta"] > 0.0
+        else None
+        for row in selected
+    ]
+
+    item = payload.item
+    pending_pure = item.epsilon if item.delta == 0.0 else 0.0
+    pending_curve = (
+        rdp.single_rdp_curve(item.epsilon, item.delta)
+        if item.delta > 0.0
+        else None
+    )
+
+    n = len(selected)
+    full_mask = (1 << n) - 1
+
+    def _project(kept_mask: int, include_pending: bool) -> tuple[float, float]:
+        """Composed (epsilon, best_order) of baseline + kept candidates.
+
+        ``kept_mask`` selects the candidates that remain granted (i.e. are
+        *not* reversed); ``include_pending`` additionally composes the
+        pending analysis item on top.
+        """
+        pure_sum = base_pure
+        approx_here = baseline_has_approx
+        composed = list(base_approx_curve)
+        for i in range(n):
+            if not kept_mask & (1 << i):
+                continue
+            pure_sum += cand_pure[i]
+            curve = cand_curves[i]
+            if curve is not None:
+                approx_here = True
+                for j in range(n_orders):
+                    composed[j] += curve[j]
+        if include_pending:
+            pure_sum += pending_pure
+            if pending_curve is not None:
+                approx_here = True
+                for j in range(n_orders):
+                    composed[j] += pending_curve[j]
+        if not approx_here:
+            if pure_sum == 0.0:
+                # Mirror evaluate_entries([]): no mechanisms at all.
+                return 0.0, rdp.RDP_ORDERS[-1]
+            # Exact pure-DP basic composition.
+            return pure_sum, rdp.RDP_ORDERS[0]
+        epsilon, order = rdp.rdp_to_approx_dp(composed, target_delta)
+        return max(0.0, pure_sum + epsilon), order
+
+    # Occupancy before any reversal: baseline + every candidate (all still
+    # granted), i.e. the live ledger occupancy.
+    committed, committed_order = _project(full_mask, include_pending=False)
+
+    best_mask: Optional[int] = None  # bitmask of the reversed candidates
+    best_count = 0
+    best_after = 0.0
+    best_after_order = rdp.RDP_ORDERS[-1]
+    best_with = 0.0
+    best_with_order = rdp.RDP_ORDERS[-1]
+    best_ids: list[str] = []
+    for mask in range(1 << n):
+        kept_mask = full_mask ^ mask
+        with_epsilon, with_order = _project(kept_mask, include_pending=True)
+        if with_epsilon > cap + settings.epsilon_tolerance:
+            continue
+        after_epsilon, after_order = _project(
+            kept_mask, include_pending=False
+        )
+        count = mask.bit_count()
+        ids = sorted(cand_ids[i] for i in range(n) if mask & (1 << i))
+        if (
+            best_mask is None
+            or count < best_count
+            or (
+                count == best_count
+                and after_epsilon > best_after + settings.epsilon_tolerance
+            )
+            or (
+                count == best_count
+                and abs(after_epsilon - best_after)
+                <= settings.epsilon_tolerance
+                and ids < best_ids
+            )
+        ):
+            best_mask = mask
+            best_count = count
+            best_after, best_after_order = after_epsilon, after_order
+            best_with, best_with_order = with_epsilon, with_order
+            best_ids = ids
+
+    feasible = best_mask is not None
+    if feasible:
+        reason: Optional[str] = None
+        remaining: Optional[float] = max(0.0, cap - best_with)
+        reversal_count: Optional[int] = best_count
+        after_value: Optional[float] = best_after
+        with_value: Optional[float] = best_with
+        after_order_value: Optional[float] = best_after_order
+        with_order_value: Optional[float] = best_with_order
+    else:
+        reason = (
+            "no feasible reversal subset: even reversing every candidate "
+            f"leaves the pending item above epsilon_cap {cap:g}"
+        )
+        remaining = None
+        reversal_count = None
+        after_value = None
+        with_value = None
+        after_order_value = None
+        with_order_value = None
+
+    return {
+        "dataset_id": dataset_id,
+        "generated_at": now,
+        "item": {"epsilon": item.epsilon, "delta": item.delta},
+        "candidate_count": n,
+        "candidate_request_ids": list(selected_ids),
+        "epsilon_cap": cap,
+        "epsilon_committed": committed,
+        "rdp_best_order_committed": committed_order,
+        "feasible": feasible,
+        "reason": reason,
+        "suggested_request_ids": best_ids if feasible else [],
+        "reversal_count": reversal_count,
+        "epsilon_after_reversal": after_value,
+        "epsilon_with_pending": with_value,
+        "epsilon_remaining": remaining,
+        "rdp_best_order_after_reversal": after_order_value,
+        "rdp_best_order_with_pending": with_order_value,
     }

@@ -887,5 +887,114 @@ class RepeatRunTrialView(BaseModel):
     next_run_projection: Optional[RepeatRunProjection] = None
 
 
+# ---------------------------------------------------------- reversal plans --
+
+
+# A read-only reversal-plan trial enumerates every reversal subset of the
+# candidate requests, so the candidate count is capped tightly (2**12 = 4096
+# subsets at most).
+MIN_REVERSAL_PLAN_CANDIDATES = 1
+MAX_REVERSAL_PLAN_CANDIDATES = 12
+
+
+class ReversalPlanItem(BaseModel):
+    """The pending (not yet submitted) analysis item a reversal plan trials."""
+
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.1])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-7],
+        description="Item delta; use 0 for pure epsilon-DP.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+
+class ReversalPlanRequest(BaseModel):
+    """One pending analysis item plus 1-12 distinct reversal candidates."""
+
+    item: ReversalPlanItem = Field(
+        ...,
+        description="Pending analysis item (epsilon, delta) trialled on top "
+        "of each candidate reversal subset; it is never submitted.",
+    )
+    request_ids: list[str] = Field(
+        ...,
+        min_length=MIN_REVERSAL_PLAN_CANDIDATES,
+        max_length=MAX_REVERSAL_PLAN_CANDIDATES,
+        examples=[["req-20260924-0001", "req-20260924-0002"]],
+        description="1-12 client-chosen, mutually distinct request_ids that "
+        "may be reversed to make room.  Each must identify a granted, "
+        "not-yet-reversed request of this dataset.",
+    )
+
+    @field_validator("request_ids")
+    @classmethod
+    def _valid_request_ids(cls, v: list[str]) -> list[str]:
+        for request_id in v:
+            if not 1 <= len(request_id) <= 200:
+                raise ValueError(
+                    "each request_id must be a string of 1-200 characters"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _unique_request_ids(self) -> "ReversalPlanRequest":
+        seen: set[str] = set()
+        for request_id in self.request_ids:
+            if request_id in seen:
+                raise ValueError(
+                    f"request_id {request_id!r} occurs more than once; "
+                    "request_id must be unique within the request"
+                )
+            seen.add(request_id)
+        return self
+
+
+class ReversalPlanView(BaseModel):
+    """Result of a read-only reversal-plan trial.
+
+    Nothing is persisted and no reservation is swept: every call recomputes
+    against the live ledger.  ``epsilon_committed`` is the occupancy before
+    any reversal (all candidates still granted); ``epsilon_after_reversal``
+    is the ledger occupancy once the suggested requests are reversed;
+    ``epsilon_with_pending`` additionally composes the pending item on top.
+    When no reversal subset lets the pending item fit, ``feasible`` is false
+    and the plan-specific fields are null.
+    """
+
+    dataset_id: str
+    generated_at: datetime
+    # Pending analysis item echoed back as submitted.
+    item: ReversalPlanItem
+    candidate_count: int
+    # Candidate ids, echoed in the request's supplied order.
+    candidate_request_ids: list[str]
+    epsilon_cap: float
+    # Occupancy before any reversal: every other non-reversed granted
+    # request plus the currently non-expired reservations plus every
+    # candidate (all still granted), i.e. the live ledger occupancy.
+    epsilon_committed: float
+    rdp_best_order_committed: float
+    feasible: bool
+    # Human-readable explanation when no reversal subset fits; null otherwise.
+    reason: Optional[str] = None
+    # Suggested requests to reverse, sorted ascending; empty when infeasible
+    # or when the pending item already fits without any reversal.
+    suggested_request_ids: list[str]
+    reversal_count: Optional[int] = None
+    # Ledger occupancy once the suggested requests are reversed.
+    epsilon_after_reversal: Optional[float] = None
+    # Occupancy once the pending item is additionally composed on top.
+    epsilon_with_pending: Optional[float] = None
+    # epsilon_cap - epsilon_with_pending, floored at zero.
+    epsilon_remaining: Optional[float] = None
+    rdp_best_order_after_reversal: Optional[float] = None
+    rdp_best_order_with_pending: Optional[float] = None
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
