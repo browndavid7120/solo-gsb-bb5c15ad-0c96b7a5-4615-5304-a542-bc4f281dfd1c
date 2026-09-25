@@ -887,5 +887,115 @@ class RepeatRunTrialView(BaseModel):
     next_run_projection: Optional[RepeatRunProjection] = None
 
 
+# ------------------------------------------------------------ reversal plans --
+
+
+# A read-only reversal plan enumerates every subset of the candidate
+# reversible requests, so the candidate count is capped tightly
+# (2**12 = 4096 subsets at most).
+MIN_REVERSAL_PLAN_CANDIDATES = 1
+MAX_REVERSAL_PLAN_CANDIDATES = 12
+
+
+class ReversalPlanPendingItem(BaseModel):
+    """The pending analysis item a reversal plan tries to make room for."""
+
+    epsilon: float = Field(..., gt=0.0, le=1_000.0, examples=[0.1])
+    delta: float = Field(
+        ...,
+        ge=0.0,
+        lt=1.0,
+        examples=[1e-7],
+        description="Pending item delta; use 0 for pure epsilon-DP.",
+    )
+
+    _eps_finite = _finite("epsilon")
+    _delta_finite = _finite("delta")
+
+
+class ReversalPlanRequest(BaseModel):
+    """One pending item plus 1-12 distinct reversible request_id candidates."""
+
+    pending_item: ReversalPlanPendingItem = Field(
+        ...,
+        description="The analysis item (epsilon, delta) the plan tries to "
+        "fit under epsilon_cap by simulating reversals; it is never "
+        "actually submitted.",
+    )
+    request_ids: list[str] = Field(
+        ...,
+        min_length=MIN_REVERSAL_PLAN_CANDIDATES,
+        max_length=MAX_REVERSAL_PLAN_CANDIDATES,
+        examples=[["req-20260924-0001", "req-20260924-0002"]],
+        description="1-12 client-chosen, mutually distinct request_ids.  "
+        "Each must identify a granted, not-yet-reversed request of this "
+        "dataset; every subset of them is trialled as a reversal plan.",
+    )
+
+    @field_validator("request_ids")
+    @classmethod
+    def _valid_request_ids(cls, v: list[str]) -> list[str]:
+        for request_id in v:
+            if not 1 <= len(request_id) <= 200:
+                raise ValueError(
+                    "each request_id must be a string of 1-200 characters"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _unique_request_ids(self) -> "ReversalPlanRequest":
+        seen: set[str] = set()
+        for request_id in self.request_ids:
+            if request_id in seen:
+                raise ValueError(
+                    f"request_id {request_id!r} occurs more than once; "
+                    "request_id must be unique within the request"
+                )
+            seen.add(request_id)
+        return self
+
+
+class ReversalPlanView(BaseModel):
+    """Result of a read-only reversal-plan trial.
+
+    Nothing is persisted and no reservation is swept: no reversal, request,
+    reservation or verdict record is ever created, and every call recomputes
+    against the live ledger.  ``epsilon_before`` is the committed occupancy
+    before any simulated reversal; ``epsilon_after_reversal`` the occupancy
+    once the suggested subset is reversed; ``epsilon_with_pending`` the
+    occupancy once the pending item is additionally composed in.  When no
+    reversal subset can fit the pending item, ``feasible`` is false and the
+    suggestion fields are null.
+    """
+
+    dataset_id: str
+    generated_at: datetime
+    # Deterministic identifier of the suggested plan (derived from the
+    # dataset, the pending item, the candidates and the chosen subset);
+    # null when infeasible.
+    suggestion_id: Optional[str]
+    feasible: bool
+    reason: Optional[str] = None
+    # The pending item echoed back as supplied.
+    pending_item: ReversalPlanPendingItem
+    candidate_count: int
+    # Candidate ids echoed in the request's supplied order.
+    candidate_request_ids: list[str]
+    # Suggested request_ids to reverse, sorted ascending; empty when the
+    # pending item already fits (or when no subset is feasible).
+    reversal_ids: list[str]
+    reversal_count: int
+    epsilon_cap: float
+    # Composed occupancy before any simulated reversal (baseline + the whole
+    # candidate group, i.e. the current ledger occupancy).
+    epsilon_before: float
+    # Composed occupancy after reversing the suggested subset.
+    epsilon_after_reversal: Optional[float]
+    # Composed occupancy after the suggested reversals plus the pending item.
+    epsilon_with_pending: Optional[float]
+    rdp_best_order_after_reversal: Optional[float]
+    rdp_best_order_with_pending: Optional[float]
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)

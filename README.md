@@ -87,6 +87,18 @@ delta_cap 与已入账申请、预留均不变。来源转出后上限必须仍�
 `null`）；纯 ε 项在任意次数下仍走精确加法。试算**严格只读**：不创建申请、
 不写任何裁定记录、不触发预留惰性清扫，每次调用都按最新账本重算。
 
+最后提供**只读的冲正建议试算（reversal plan）**：
+`POST /datasets/{dataset_id}/reversal-plans` 接收**一个待申请分析项**
+（`epsilon`、`delta`）与 **1～12 个互异**的可冲正 `request_id`（仅限本数据集
+**已授权且未冲正**的申请：缺失 → `404`，已拒绝或已冲正 → `409`）。服务以
+**其余**未冲正已授权申请与**当前未到期**的 granted 预留为固定基线，**穷举候选
+冲正子集**并按既有 RDP 口径试算「冲正该子集后再加入待申请项」的投影占用，找出
+不超 `epsilon_cap` 的可行方案：先取**冲正条数最少**，再取**冲正后账本投影占用
+最大**，仍同分取 **`request_id` 升序列表字典序最小**者。响应给出确定性**建议
+ID**、建议冲正的 ID 列表与冲正前 / 冲正后 / 加入待申请项后的占用；**无可行
+子集**时明确返回 `feasible=false`。试算**严格只读**：不执行冲正或申请、不写
+任何记录、不触发预留惰性清扫，每次调用都按最新账本重算。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
@@ -184,6 +196,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/datasets/{dataset_id}/selection-plans` | **只读**试算：穷举 1～12 个候选的可行子集，返回总 value 最大的组合（不落库） |
 | `POST` | `/datasets/{dataset_id}/cost-attributions` | **只读**：对 1～10 个已授权未冲正申请按 Shapley 边际增量分摊整组 epsilon 增量（不落库） |
 | `POST` | `/datasets/{dataset_id}/repeat-run-trials` | **只读**：把 1～5 个分析项作为一组工作负载，求 1～100000 内不超 cap 的最大完整运行次数及再跑一次的投影（不落库） |
+| `POST` | `/datasets/{dataset_id}/reversal-plans` | **只读**：为待申请分析项穷举 1～12 个可冲正申请的冲正子集，返回冲正条数最少（再按冲正后占用最大、ID 字典序）的可行建议（不落库） |
 | `POST` | `/datasets/{dataset_id}/request-batches` | 原子提交 2～20 项分析批次（整批批准或整批拒绝，按 `batch_id` 幂等） |
 | `GET` | `/datasets/{dataset_id}/request-batches/{batch_id}` | 按 `batch_id` 查询批次裁定与各项当时的组合值 |
 | `POST` | `/datasets/{dataset_id}/requests/{request_id}/reversals` | 冲正一条已授权且未冲正的申请（按 `reversal_id` 幂等） |
@@ -1140,6 +1153,99 @@ curl -X POST http://localhost:8000/datasets/sales-2026/repeat-run-trials \
 * 分析项为 0 个或超过 5 个、`max_runs` 不在 `1..100000`（含小数）、
   `epsilon` / `delta` 越界等 → `422`。
 
+### 4.19 冲正建议试算（reversal plan，只读）
+
+在**不执行任何冲正或申请、不改变预留状态**的前提下，为一个待申请分析项试算
+「需要冲正哪些已授权申请才能放得下」。占用基线与正式准入完全一致：**其余**
+未冲正 granted 申请 + 全部**未到期** granted 预留（已释放 / 已确认 / 已过期 /
+被拒绝的预留不参与；候选申请本身不计入基线，而是作为可冲正对象）。
+
+```bash
+curl -X POST http://localhost:8000/datasets/sales-2026/reversal-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "pending_item": {"epsilon": 0.2, "delta": 1e-8},
+    "request_ids": ["req-20260924-0001", "req-20260924-0002"]
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `pending_item` | object | 必填，待申请分析项（仅参与试算，不会真正提交） |
+| `pending_item.epsilon` | float | `> 0, ≤ 1000`，待申请项的 epsilon |
+| `pending_item.delta` | float | `>= 0, < 1`；`0` 表示纯 ε-DP |
+| `request_ids` | array | 必填，**1～12 个**、**互不重复**的 `request_id`（每个 1–200 字符）；每个都必须是本数据集**已授权且未冲正**的申请 |
+
+服务以「其余未冲正已授权申请 + 当前未到期 granted 预留」为**固定基线**，穷举
+候选申请的**全部 2ⁿ 个子集**：对子集 `S`，把「基线 + 未被冲正的候选 + 待申请
+项」按既有 RDP 口径（同一张 orders 网格、同一浮点容差、纯 ε 精确加法）投影，
+投影 `≤ epsilon_cap + EPSILON_TOLERANCE` 即为可行方案（**空集**表示不冲正直接
+申请，同样参与竞争）。在全部可行方案中按以下顺序裁定：
+
+1. **冲正条数最少**；
+2. 冲正条数相同 → **冲正后账本投影占用最大**（基线 + 剩余候选，不含待申请项，
+   即尽量少释放预算）；
+3. 仍相同 → 按 **`request_id` 升序列表的字典序**取最小者。
+
+可行时返回 `200`：
+
+```json
+{
+  "dataset_id": "sales-2026",
+  "generated_at": "2026-09-25T12:00:00.000000Z",
+  "suggestion_id": "rplan-9f2c7a1b4d5e6f708192a3b4",
+  "feasible": true,
+  "reason": null,
+  "pending_item": {"epsilon": 0.2, "delta": 1e-8},
+  "candidate_count": 2,
+  "candidate_request_ids": ["req-20260924-0001", "req-20260924-0002"],
+  "reversal_ids": ["req-20260924-0002"],
+  "reversal_count": 1,
+  "epsilon_cap": 1.0,
+  "epsilon_before": 0.5062,
+  "epsilon_after_reversal": 0.4039,
+  "epsilon_with_pending": 0.6062,
+  "rdp_best_order_after_reversal": 8192.0,
+  "rdp_best_order_with_pending": 8192.0
+}
+```
+
+字段说明：
+
+* `suggestion_id`：建议的**确定性**标识（由数据集、待申请项、候选集合与选中
+  子集计算摘要），账本不变时重复调用得到相同 ID，候选顺序不影响该 ID；
+* `reversal_ids`：建议冲正的 `request_id`，**按升序输出**；为空表示待申请项
+  无需冲正即可直接放下；
+* `epsilon_before`：试算时刻「基线 + 全部候选」的组合占用，即当前账本占用
+  （与预算视图口径一致）；
+* `epsilon_after_reversal`：冲正建议子集后的账本投影占用（不含待申请项）；
+* `epsilon_with_pending`：冲正后再**加入待申请项**的投影占用，恒
+  `≤ epsilon_cap + EPSILON_TOLERANCE`。
+
+**无可行子集**（即使冲正全部候选也放不下待申请项）时仍返回 `200`，但
+`feasible=false`、`suggestion_id=null`、`reversal_ids=[]`，冲正后与加入待申请
+项后的占用字段为 `null`，`reason` 说明原因；`epsilon_before` 仍给出当前占用。
+
+语义与边界：
+
+* **严格只读、无幂等键**：本接口不执行冲正、不提交申请、不写任何表（不产生
+  申请、预留、批次、转拨或冲正记录），也**不触发预留惰性清扫**（与
+  release-forecast、selection plan、cost attribution、repeat-run trial 同为纯
+  SELECT）；**每次调用都按最新账本重算**——账本被其他申请 / 预留 / 冲正 /
+  转拨改变后，再次试算可能得到不同建议；
+* 建议仅是试算结果，不锁定额度、不改变任何申请状态，也不构成对未来准入的
+  承诺；实际冲正与申请仍需调用正式接口（`POST …/requests/{id}/reversals`、
+  `POST …/requests`），按当时账本重新判定；
+* 候选申请不存在（含被其他数据集拥有的 `request_id`）→
+  `404 request_not_found`；候选为 `rejected` → `409 request_not_granted`；
+  候选**已冲正** → `409 request_already_reversed`（按请求顺序报告首个不合法
+  ID）；
+* 数据集不存在 → `404 dataset_not_found`；
+* `request_ids` 为空或超过 12 个、存在重复 ID、ID 为空或超长、待申请项
+  `epsilon` / `delta` 越界等 → `422`。
+
 ---
 
 ## 5. RDP 组合会计（核算口径）
@@ -1201,6 +1307,14 @@ curl -X POST http://localhost:8000/datasets/sales-2026/repeat-run-trials \
    `runs` 单调，故以二分查找求 `0..max_runs`（上界 100000）内投影不超 cap 的
    最大完整运行次数，并返回该次数与再运行一次（`max_complete_runs + 1`）两次
    投影；当最大次数已达 `max_runs` 时不评估上界之外的运行。零次可行也会返回。
+
+10. 冲正建议试算（reversal plan）同样**不改变任何集合、纯 SELECT**：以「其余
+    未冲正已授权申请 ∪ 当前未到期预留」为固定基线，穷举 1～12 个候选可冲正
+    申请的全部 2ⁿ 个子集；对每个子集把「基线 + 剩余候选 + 待申请项」按与准入
+    完全相同的口径（含纯 ε 精确加法分支）投影，保留不超 cap 的可行子集后按
+    「冲正条数最少 → 冲正后账本投影占用最大 → `request_id` 升序列表字典序」
+    裁定；无可行子集时明确返回不可行。全程不执行冲正或申请、不做惰性清扫，
+    重复调用按最新账本重算。
 
 特殊情形：
 
@@ -1264,6 +1378,10 @@ curl -X POST http://localhost:8000/datasets/sales-2026/repeat-run-trials \
 * 只读的重复工作负载容量试算（repeat-run trial）同样**不进入写临界区、不开启
   写事务、不做惰性清扫**：纯 SELECT 读取未冲正申请与未到期预留后，在进程内以
   曲线倍乘 + 二分查找计算最大可行完整运行次数；与任何并发写互不阻塞，绝不改变
+  数据库状态，每次调用都按实时账本重算。
+* 只读的冲正建议试算（reversal plan）同样**不进入写临界区、不开启写事务、不做
+  惰性清扫**：纯 SELECT 读取未冲正已授权申请与未到期预留后，在进程内穷举候选
+  冲正子集并试算待申请项；不执行冲正或申请，与任何并发写互不阻塞，绝不改变
   数据库状态，每次调用都按实时账本重算。
 
 ---
@@ -1380,6 +1498,17 @@ DP（含纯 / 近似混合组、含已存在占用）结果与直接调用 `rdp.
 不触发惰性清扫、重复调用结果稳定）、账本变化后按最新占用重算、恰好到 cap 的
 第 N 次仍可行（含浮点容差）、1～5 项与混合组、5 项边界，以及缺失数据集 404、
 0 / 6 项、`max_runs` 越界（0、100001、小数）与 epsilon/delta 越界 422。
+
+冲正建议试算测试另覆盖：待申请项无需冲正即可放下（空建议）、冲正条数最少优先、
+同条数取冲正后账本投影占用最大、再同分按 `request_id` 升序列表字典序、需要两条
+冲正的组合、无可行子集明确返回不可行（建议 ID 与冲正后占用字段为 null）、与直接
+调用 `rdp.py` 的独立暴力穷举交叉校验（含混合纯 / 近似 DP 与含预留基线）、基线
+包含其他未冲正申请与未到期预留且与预算视图一致、已过期预留不参与且不被本接口
+清扫、已冲正申请不参与、严格只读（不产生任何记录、不执行冲正、重复调用结果
+稳定）、账本变化后按最新占用重算、建议 ID 的确定性与候选顺序无关性、12 个候选
+边界，以及缺失数据集 404、缺失申请 404、已拒绝 409 request_not_granted、已冲正
+409 request_already_reversed、空 / 13 个 / 重复 ID / 空 ID / 超长 ID 与非法
+待申请项 422。
 
 ---
 
